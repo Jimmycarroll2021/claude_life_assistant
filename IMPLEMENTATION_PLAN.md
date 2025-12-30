@@ -1,7 +1,9 @@
-# Life Assistant Mobile App - Implementation Plan
+# Life Assistant Mobile App - Implementation Plan (REVISED)
 
 ## Overview
-Build a mobile app with clean UI that acts as your personal coach, powered by Claude API, reading from CLAUDE.md/NOW.md files stored on Pi5/server.
+Build a mobile app with clean UI that acts as your personal coach, powered by **Claude Code CLI** (using your Max plan), reading from CLAUDE.md/NOW.md files in this repo.
+
+**Key Change**: Uses Claude Code CLI instead of Claude API = **$0/month** instead of $50-150/month.
 
 ---
 
@@ -11,7 +13,7 @@ Build a mobile app with clean UI that acts as your personal coach, powered by Cl
 
 ```
 ┌─────────────────────────────────────────┐
-│         Mobile App (React Native)       │
+│    Mobile Interface (PWA or App)        │
 │  ┌─────────────────────────────────┐   │
 │  │  Chat Interface                  │   │
 │  │  Quick Actions (/start-day, etc)│   │
@@ -19,26 +21,28 @@ Build a mobile app with clean UI that acts as your personal coach, powered by Cl
 │  │  Push Notification Handler       │   │
 │  └─────────────────────────────────┘   │
 └──────────────┬──────────────────────────┘
-               │ HTTPS/WSS
+               │ HTTPS
                │
 ┌──────────────▼──────────────────────────┐
-│       Backend API (Node.js/Express)     │
+│    Backend API (Node.js/Express)        │
 │  ┌─────────────────────────────────┐   │
-│  │  /api/chat                       │   │
-│  │  /api/update-now                 │   │
-│  │  /api/get-context                │   │
+│  │  Wraps Claude Code CLI           │   │
+│  │  /api/chat → `claude` command    │   │
+│  │  /api/slash-command              │   │
 │  │  /api/reminders                  │   │
-│  │  WebSocket for real-time updates│   │
 │  └─────────────────────────────────┘   │
 └──────────────┬──────────────────────────┘
                │
-        ┌──────┴──────┐
-        │             │
-┌───────▼──────┐  ┌──▼────────────┐
-│ Claude API   │  │ File System   │
-│ (Anthropic)  │  │ CLAUDE.md     │
-│              │  │ NOW.md        │
-└──────────────┘  └───────────────┘
+        ┌──────┴──────────┐
+        │                 │
+┌───────▼──────────┐  ┌──▼────────────┐
+│ Claude Code CLI  │  │ This Git Repo │
+│ (Max Plan)       │  │ CLAUDE.md     │
+│ Existing cmds:   │  │ NOW.md        │
+│ /start-day       │  │ .claude/      │
+│ /end-day         │  │  commands/    │
+│ /check-day       │  │               │
+└──────────────────┘  └───────────────┘
 ```
 
 ---
@@ -48,12 +52,12 @@ Build a mobile app with clean UI that acts as your personal coach, powered by Cl
 ### Tech Stack
 - **Runtime**: Node.js 20+
 - **Framework**: Express.js
-- **Claude Integration**: @anthropic-ai/sdk
-- **File Operations**: fs/promises
+- **Claude Integration**: `child_process` wrapping `claude` CLI
+- **Session Management**: In-memory Map (simple) or Redis (production)
 - **Scheduler**: node-cron
-- **Push Notifications**: Firebase Admin SDK
-- **Auth**: API Key + JWT
-- **WebSocket**: Socket.io (optional for real-time)
+- **Push Notifications**: Firebase Admin SDK (or simple polling)
+- **Auth**: API Key (single user)
+- **CORS**: For PWA access from phone
 
 ### Project Structure
 ```
@@ -166,32 +170,66 @@ Response:
 }
 ```
 
-### Claude Integration Strategy
+### Claude Code CLI Integration Strategy
 
-**Context Building**:
+**How It Works**:
+Claude Code CLI automatically reads CLAUDE.md + NOW.md from the current directory. We leverage this by running `claude` commands from this repo directory.
+
+**Basic Wrapper**:
 ```javascript
-// On every chat request:
-const systemPrompt = `
-${fs.readFileSync('CLAUDE.md', 'utf-8')}
+const { spawn } = require('child_process');
+const path = require('path');
 
-${fs.readFileSync('NOW.md', 'utf-8')}
+async function askClaude(message, sessionId = null) {
+  return new Promise((resolve, reject) => {
+    const repoPath = '/home/user/claude_life_assistant';
 
-You are the agent described in CLAUDE.md.
-Current state is in NOW.md.
-Respond according to your rules and personality.
-`;
+    const claude = spawn('claude', [], {
+      cwd: repoPath, // Run from repo directory
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
 
-const response = await anthropic.messages.create({
-  model: 'claude-sonnet-4-5-20250929',
-  max_tokens: 1024,
-  system: systemPrompt,
-  messages: conversationHistory
-});
+    let output = '';
+    let errorOutput = '';
+
+    // Send message to Claude
+    claude.stdin.write(message + '\n');
+    claude.stdin.end();
+
+    // Collect response
+    claude.stdout.on('data', (data) => {
+      output += data.toString();
+    });
+
+    claude.stderr.on('data', (data) => {
+      errorOutput += data.toString();
+    });
+
+    claude.on('close', (code) => {
+      if (code === 0) {
+        resolve(output.trim());
+      } else {
+        reject(new Error(errorOutput));
+      }
+    });
+  });
+}
 ```
 
-**Conversation Memory**:
-- Store last 10 messages in Redis or in-memory (simple Map)
-- Or stateless: send full CLAUDE.md + NOW.md each time (works with Claude's long context)
+**Slash Commands**:
+```javascript
+// Existing slash commands already work
+async function runSlashCommand(command) {
+  // Commands: start-day, end-day, check-day
+  return askClaude(`/${command}`);
+}
+```
+
+**Conversation State**:
+- Claude CLI maintains session state automatically
+- Each API request = new Claude CLI instance
+- For multi-turn: Store conversation history in backend, send full context each time
+- OR: Use session files that Claude CLI can read
 
 ### Scheduled Reminders
 
@@ -271,16 +309,26 @@ sudo certbot --nginx -d your-domain.com
 
 ---
 
-## Part 2: Mobile App (React Native)
+## Part 2: Mobile Interface
 
-### Tech Stack
+### Tech Stack (PWA - Recommended for MVP)
+- **Framework**: Plain HTML/CSS/JS OR React (if you prefer)
+- **UI**: Simple responsive CSS (mobile-first)
+- **HTTP**: Fetch API
+- **Storage**: LocalStorage
+- **"Install"**: Add to Home Screen (iOS/Android)
+- **Notifications**: Browser push (limited on iOS) OR just polling
+
+### Alternative: React Native + Expo
 - **Framework**: React Native + Expo
 - **Navigation**: React Navigation
-- **State**: Zustand (lightweight) or Context API
-- **HTTP**: Axios
+- **State**: Context API (simple)
+- **HTTP**: Fetch API
 - **Push**: Expo Notifications
-- **UI**: React Native Paper or NativeBase
+- **UI**: React Native Paper
 - **Storage**: AsyncStorage
+
+**Recommendation**: Start with PWA. Simpler, faster, no app store. Upgrade to React Native later if needed.
 
 ### Project Structure
 ```
@@ -505,24 +553,49 @@ REPO_PATH=/home/user/claude_life_assistant
 
 ---
 
-## Security Considerations
+## ⚠️ CRITICAL RISKS (Claude CLI Approach)
 
-1. **API Authentication**: Simple API key for v1, JWT for multi-user later
-2. **HTTPS Only**: Use SSL cert on Pi5
-3. **Rate Limiting**: Prevent API abuse
-4. **Input Validation**: Sanitize all inputs
-5. **Secrets Management**: Never commit API keys
-6. **Firebase Rules**: Restrict who can send push notifications
+This approach is a **hack** and comes with real risks:
+
+1. **Not Officially Supported**: Claude Code CLI is not designed as a backend service
+2. **May Break**: Anthropic could change CLI behavior, add rate limits, or block this usage
+3. **Rate Limiting Risk**: Unclear if Max plan has usage limits for CLI automation
+4. **Session Management**: CLI sessions are ephemeral, harder to maintain context
+5. **Error Handling**: CLI output parsing can be brittle
+6. **No SLA**: If it breaks, you're on your own
+
+**Mitigation**:
+- Build it anyway (free is free)
+- Be ready to pivot to Claude API if needed
+- Keep backend abstracted so switching is easy
+- Monitor for any issues from Anthropic
+
+**If Anthropic blocks this**: Fall back to manual Claude app usage or pay for API.
 
 ---
 
-## Cost Breakdown
+## Security Considerations
+
+1. **API Authentication**: Simple API key for v1 (single user)
+2. **HTTPS**: Use Let's Encrypt OR self-signed cert for testing
+3. **Rate Limiting**: Add basic rate limiting to prevent abuse
+4. **Input Validation**: Sanitize all inputs before passing to CLI
+5. **Secrets Management**: API key in .env, never commit
+6. **Firewall**: Only expose necessary ports on Pi5
+
+---
+
+## Cost Breakdown (REVISED)
 
 - **Infrastructure**: $0 (using existing Pi5 + cloud server)
-- **Claude API**: Included in Max plan (monitor usage)
-- **Firebase**: Free tier (up to 10k notifications/day)
-- **Domain/SSL**: $12/year (optional, can use IP)
-- **Total**: ~$0-12/year
+- **Claude Max Plan**: $200/mo (already paying)
+- **Claude Code CLI**: Included in Max plan ✓
+- **Firebase**: Free tier (up to 10k notifications/day) OR skip for MVP
+- **Domain/SSL**: $12/year (optional, can use IP + self-signed for testing)
+- **Apple Developer**: $0 (using PWA, no App Store needed)
+- **Total Additional Cost**: **$0-12/year**
+
+**Key Savings**: Using Claude CLI instead of API = **$600-1800/year saved**
 
 ---
 
@@ -554,12 +627,82 @@ REPO_PATH=/home/user/claude_life_assistant
 
 ---
 
+## Simplified MVP Roadmap (2-3 Days)
+
+### Day 1: Minimal Backend
+**Goal**: Get basic chat working via Claude CLI
+
+1. Create `backend/` directory
+2. Initialize Node.js project (`npm init -y`)
+3. Install: `express`, `cors`, `dotenv`
+4. Create single `server.js` with:
+   - POST `/api/chat` endpoint
+   - Wraps `claude` CLI via `child_process`
+   - Returns response
+5. Test with curl locally
+6. Deploy to Pi5 with PM2
+
+**Success**: `curl -X POST http://pi5:3000/api/chat -d '{"message":"hello"}'` returns Claude response
+
+### Day 2: Simple Web UI
+**Goal**: Mobile-friendly chat interface
+
+1. Create `frontend/` directory
+2. Single HTML file with:
+   - Chat bubbles (flex column)
+   - Input box at bottom
+   - Fetch to backend `/api/chat`
+   - Responsive CSS (mobile-first)
+3. Serve via nginx or `python -m http.server`
+4. Test on phone browser
+
+**Success**: Open on phone, send message, get response
+
+### Day 3: Quick Actions + Polish
+**Goal**: Add slash commands and basic UX
+
+1. Add buttons for `/start-day`, `/end-day`, `/check-day`
+2. Add loading spinner
+3. Add error handling
+4. Store API URL in localStorage
+5. Add simple auth (API key in header)
+6. Add to home screen instructions
+
+**Success**: Usable life coach in your pocket
+
+### Optional: Reminders (Later)
+- Add node-cron for scheduled notifications
+- Use Firebase OR simple email/SMS OR skip for MVP
+
+---
+
+## What We're NOT Building (For MVP)
+
+- ❌ Complex conversation state
+- ❌ User accounts / multi-user
+- ❌ Push notifications (use manual check-ins)
+- ❌ Offline mode
+- ❌ React Native app
+- ❌ Database
+- ❌ WebSockets
+- ❌ File upload
+
+Keep it stupid simple. Ship fast, iterate based on actual usage.
+
+---
+
 ## Next Steps
 
-1. **Review this plan** - Any changes needed?
-2. **Start backend scaffolding** - Set up project structure
-3. **Deploy to Pi5** - Get it running
-4. **Build mobile app** - UI + API integration
-5. **Test end-to-end** - Full flow with real device
+**Option 1: Build MVP (Recommended)**
+- Start with Day 1 backend
+- Get something working in 2-3 days
+- See if Claude CLI approach actually works
+- Validate you'll actually use it
 
-Ready to start scaffolding the backend?
+**Option 2: Test First**
+- Try running `claude` from terminal in this repo
+- See how it responds to messages
+- Manually test slash commands
+- Decide if wrapping it will work
+
+**Which path?**
